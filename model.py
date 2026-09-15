@@ -1,189 +1,206 @@
+from __future__ import annotations
+
+import logging
+import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Protocol
 
+import numpy as np
 import torch
-import torch.nn as nn
-from torch import Tensor
 
-CLASSES = [
-    "А", "Б", "В", "Г", "Д", "Е", "Ё", "Ж", "З", "И", "Й",
-    "К", "Л", "М", "Н", "О", "П", "Р", "С", "Т", "У", "Ф",
-    "Х", "Ц", "Ч", "Ш", "Щ", "Ъ", "Ы", "Ь", "Э", "Ю", "Я"
-]
+from model_old import SignLanguageTransformer
 
-CLASS_TO_IDX = {label: idx for idx, label in enumerate(CLASSES)}
-IDX_TO_CLASS = {idx: label for idx, label in enumerate(CLASSES)}
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
 
-NUM_CLASSES = len(CLASSES)
-
-DROPOUT = 0.3
-HIDDEN_SIZE = 128
-NUM_LANDMARKS = 21
-NUM_HANDS = 2
-INPUT_SIZE = NUM_HANDS * NUM_LANDMARKS * 3
-NUM_HEADS = 4
-NUM_LAYERS = 2
-SEQUENCE_LENGTH = 80
 
 @dataclass(frozen=True)
 class ModelConfig:
-    input_size: int = INPUT_SIZE
-    sequence_length: int = SEQUENCE_LENGTH
-    hidden_size: int = HIDDEN_SIZE
-    num_heads: int = NUM_HEADS
-    num_layers: int = NUM_LAYERS
-    dropout: float = DROPOUT
-    num_classes: int = NUM_CLASSES
-    ff_multiplier: int = 4
-    temporal_kernel_size: int = 5
+    """Имена моделей. ONNX всегда проверяется первым."""
+
+    onnx_name: str = "best_model_bukva.onnx"
+    pth_name: str = "best_model_bukva.pth"
+    sequence_length: int = 80
+    input_size: int = 126
+    num_classes: int = 33
 
 
-class SinusoidalPositionalEncoding(nn.Module):
-    def __init__(self, hidden_size: int, max_len: int) -> None:
-        super().__init__()
-        position = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, hidden_size, 2, dtype=torch.float32)
-            * (-torch.log(torch.tensor(10000.0)) / hidden_size)
+class Runtime(Protocol):
+    backend_name: str
+    device_description: str
+
+    def predict_logits(self, sequence: np.ndarray) -> np.ndarray:
+        ...
+
+
+def stable_softmax(logits: np.ndarray) -> np.ndarray:
+    logits = np.asarray(logits, dtype=np.float32)
+    logits = logits - np.max(logits, axis=1, keepdims=True)
+    exp_logits = np.exp(logits)
+    return exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+
+
+class OnnxRuntimeBackend:
+    backend_name = "ONNX Runtime"
+
+    def __init__(self, path: str, config: ModelConfig):
+        if ort is None:
+            raise RuntimeError(
+                "Найден ONNX-файл, но пакет onnxruntime не установлен. "
+                "Установите: pip install onnxruntime"
+            )
+
+        available = ort.get_available_providers()
+        preferred = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        providers = [provider for provider in preferred if provider in available]
+
+        if not providers:
+            raise RuntimeError(
+                "ONNX Runtime установлен, но не найден ни CUDAExecutionProvider, "
+                "ни CPUExecutionProvider."
+            )
+
+        self.session = ort.InferenceSession(path, providers=providers)
+        self.input_info = self.session.get_inputs()[0]
+        self.output_info = self.session.get_outputs()[0]
+        self.input_name = self.input_info.name
+        self.device_description = ", ".join(self.session.get_providers())
+
+        self._validate_model_shape(config)
+        logging.info(
+            "ONNX Runtime инициализирован: файл=%s, providers=%s, input=%s",
+            path,
+            self.device_description,
+            self.input_info.shape,
         )
 
-        pe = torch.zeros(max_len, hidden_size, dtype=torch.float32)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("encoding", pe.unsqueeze(0), persistent=False)
+    def _validate_model_shape(self, config: ModelConfig) -> None:
+        # Обычно форма: [batch, 80, 126]. None или str означает динамическую ось.
+        shape = self.input_info.shape
+        if len(shape) != 3:
+            raise ValueError(
+                "ONNX-модель должна принимать 3D tensor [batch, sequence, features], "
+                f"но имеет форму input {shape}."
+            )
 
-    def forward(self, x: Tensor) -> Tensor:
-        return x + self.encoding[:, : x.size(1)]
-
-
-class TemporalStem(nn.Module):
-    """Adds motion features + local temporal mixing before transformer blocks."""
-
-    def __init__(self, input_size: int, hidden_size: int, kernel_size: int, dropout: float) -> None:
-        super().__init__()
-        self.input_projection = nn.Linear(input_size * 2, hidden_size)
-        self.depthwise_conv = nn.Conv1d(
-            in_channels=hidden_size,
-            out_channels=hidden_size,
-            kernel_size=kernel_size,
-            padding=kernel_size // 2,
-            groups=hidden_size,
-        )
-        self.pointwise_conv = nn.Conv1d(hidden_size, hidden_size, kernel_size=1)
-        self.norm = nn.LayerNorm(hidden_size)
-        self.activation = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: Tensor) -> Tensor:
-        delta = torch.zeros_like(x)
-        delta[:, 1:, :] = x[:, 1:, :] - x[:, :-1, :]
-        x = torch.cat([x, delta], dim=-1)
-
-        x = self.input_projection(x)
-        conv = x.transpose(1, 2)
-        conv = self.depthwise_conv(conv)
-        conv = self.pointwise_conv(conv).transpose(1, 2)
-
-        x = self.norm(x + conv)
-        x = self.activation(x)
-        return self.dropout(x)
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, ff_size: int, dropout: float) -> None:
-        super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.attention = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.dropout1 = nn.Dropout(dropout)
-
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.feed_forward = nn.Sequential(
-            nn.Linear(hidden_size, ff_size),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ff_size, hidden_size),
-        )
-        self.dropout2 = nn.Dropout(dropout)
-
-    def forward(self, x: Tensor, padding_mask: Optional[Tensor] = None) -> Tensor:
-        attn_input = self.norm1(x)
-        attn_output, _ = self.attention(
-            attn_input,
-            attn_input,
-            attn_input,
-            key_padding_mask=padding_mask,
-            need_weights=False,
-        )
-        x = x + self.dropout1(attn_output)
-
-        ff_input = self.norm2(x)
-        ff_output = self.feed_forward(ff_input)
-        return x + self.dropout2(ff_output)
-
-
-class SignLanguageTransformer(nn.Module):
-    """Transformer with temporal stem + CLS pooling for gesture classification."""
-
-    def __init__(self, config: Optional[ModelConfig] = None) -> None:
-        super().__init__()
-        self.config = config or ModelConfig()
-
-        self.stem = TemporalStem(
-            input_size=self.config.input_size,
-            hidden_size=self.config.hidden_size,
-            kernel_size=self.config.temporal_kernel_size,
-            dropout=self.config.dropout,
-        )
-        self.position = SinusoidalPositionalEncoding(
-            hidden_size=self.config.hidden_size,
-            max_len=self.config.sequence_length + 1,  # +1 для CLS-токена
-        )
-
-        # CLS-токен инициализируется малым нормальным шумом вместо нулей —
-        # нулевая инициализация даёт симметричный градиент через все головы
-        # внимания и замедляет специализацию CLS-позиции в первые эпохи.
-        self.cls_token = nn.Parameter(torch.empty(1, 1, self.config.hidden_size))
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-
-        ff_size = self.config.hidden_size * self.config.ff_multiplier
-        self.encoder = nn.ModuleList(
-            [
-                TransformerBlock(
-                    hidden_size=self.config.hidden_size,
-                    num_heads=self.config.num_heads,
-                    ff_size=ff_size,
-                    dropout=self.config.dropout,
+        expected = [None, config.sequence_length, config.input_size]
+        for actual, required, dimension_name in zip(
+            shape,
+            expected,
+            ("batch", "sequence_length", "input_size"),
+        ):
+            if required is None or actual is None or isinstance(actual, str):
+                continue
+            if actual != required:
+                raise ValueError(
+                    f"ONNX input dimension '{dimension_name}'={actual}, "
+                    f"но приложение ожидает {required}. "
+                    "Проверьте preprocessing и конфигурацию модели."
                 )
-                for _ in range(self.config.num_layers)
-            ]
+
+    def predict_logits(self, sequence: np.ndarray) -> np.ndarray:
+        batch = np.ascontiguousarray(sequence[np.newaxis, ...], dtype=np.float32)
+        outputs = self.session.run(None, {self.input_name: batch})
+        logits = np.asarray(outputs[0], dtype=np.float32)
+
+        if logits.ndim != 2 or logits.shape[0] != 1:
+            raise ValueError(
+                "Некорректный output ONNX-модели. Ожидаются logits формы [1, classes], "
+                f"получено: {logits.shape}."
+            )
+        return logits
+
+
+class PyTorchBackend:
+    backend_name = "PyTorch"
+
+    def __init__(self, path: str):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device_description = str(self.device)
+        self.model = SignLanguageTransformer().to(self.device)
+
+        try:
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        except TypeError:
+            # Поддержка PyTorch, где аргумент weights_only ещё не существует.
+            checkpoint = torch.load(path, map_location=self.device)
+
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        self.model.load_state_dict(state_dict)
+        self.model.eval()
+        logging.info("PyTorch checkpoint инициализирован: файл=%s, device=%s", path, self.device)
+
+    def predict_logits(self, sequence: np.ndarray) -> np.ndarray:
+        tensor = torch.from_numpy(sequence).float().unsqueeze(0).to(self.device)
+        with torch.inference_mode():
+            logits = self.model(tensor)
+        return logits.detach().cpu().numpy().astype(np.float32, copy=False)
+
+
+class SignRecognizer:
+    """
+    Унифицированный runtime для desktop-приложения.
+
+    Порядок выбора строго следующий:
+    1. best_model_bukva.onnx;
+    2. best_model_bukva.pth.
+
+    Если ONNX существует, но сломан или onnxruntime не установлен,
+    приложение намеренно НЕ переключается молча на .pth. Ошибка видна
+    в Debug Console, поскольку ONNX задан как приоритетный production-runtime.
+    """
+
+    def __init__(self, config: ModelConfig, resource_path):
+        self.config = config
+        self.backend: Runtime
+        self.model_path: str
+
+        onnx_path = resource_path(config.onnx_name)
+        pth_path = resource_path(config.pth_name)
+
+        if os.path.isfile(onnx_path):
+            print(f"Найдена ONNX-модель (приоритет): {onnx_path}")
+            self.backend = OnnxRuntimeBackend(onnx_path, config)
+            self.model_path = onnx_path
+        elif os.path.isfile(pth_path):
+            print(f"ONNX-модель не найдена. Используется PyTorch checkpoint: {pth_path}")
+            self.backend = PyTorchBackend(pth_path)
+            self.model_path = pth_path
+        else:
+            raise FileNotFoundError(
+                "Не найдены файлы модели. Ожидается один из файлов:\n"
+                f"  1) {onnx_path}  (приоритетный ONNX runtime)\n"
+                f"  2) {pth_path}   (резервный PyTorch runtime)"
+            )
+
+        print(
+            f"Backend модели: {self.backend.backend_name}; "
+            f"устройство/providers: {self.backend.device_description}"
         )
 
-        self.head = nn.Sequential(
-            nn.LayerNorm(self.config.hidden_size),
-            nn.Linear(self.config.hidden_size, 128),
-            nn.GELU(),
-            nn.Dropout(self.config.dropout),
-            nn.Linear(128, self.config.num_classes),
-        )
+    @property
+    def backend_description(self) -> str:
+        return f"{self.backend.backend_name} ({self.backend.device_description})"
 
-    def forward(self, x: Tensor, src_key_padding_mask: Optional[Tensor] = None) -> Tensor:
-        x = self.stem(x)
-        x = self.position(x)
+    def predict(self, sequence: np.ndarray, index_to_class: dict[int, str]) -> tuple[str, float]:
+        expected_shape = (self.config.sequence_length, self.config.input_size)
+        if sequence.shape != expected_shape:
+            raise ValueError(
+                "Некорректная форма входной последовательности: "
+                f"{sequence.shape}; ожидается {expected_shape}."
+            )
 
-        batch_size = x.size(0)
-        cls = self.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat([cls, x], dim=1)
+        logits = self.backend.predict_logits(sequence)
+        if logits.shape[1] != self.config.num_classes:
+            raise ValueError(
+                "Число выходных классов модели не совпадает с числом классов приложения: "
+                f"модель={logits.shape[1]}, приложение={self.config.num_classes}."
+            )
 
-        if src_key_padding_mask is not None:
-            cls_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=x.device)
-            src_key_padding_mask = torch.cat([cls_mask, src_key_padding_mask], dim=1)
+        probabilities = stable_softmax(logits)
+        class_index = int(np.argmax(probabilities[0]))
+        confidence = float(probabilities[0, class_index])
 
-        for block in self.encoder:
-            x = block(x, padding_mask=src_key_padding_mask)
-
-        return self.head(x[:, 0])
+        return index_to_class[class_index], confidence
