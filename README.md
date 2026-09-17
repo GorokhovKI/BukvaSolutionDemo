@@ -101,7 +101,7 @@ RSL-Subtitles/
 ### 1. Клонирование репозитория
 
 ```powershell
-git clone https://github.com/<YOUR_GITHUB_LOGIN>/RSL-Subtitles.git
+git clone https://github.com/GorokhovKI/RSL-Subtitles.git
 cd RSL-Subtitles
 ```
 
@@ -285,138 +285,6 @@ Output: logits [1, 33]
 
 Перед релизом сравните выходы `.pth` и `.onnx` на одинаковых входных последовательностях. Класс с максимальной вероятностью должен совпадать, а различия вероятностей должны быть малыми.
 
-## Экспорт PyTorch в ONNX
-
-Пример отдельного скрипта `export_onnx.py`:
-
-```python
-import torch
-from model import SignLanguageTransformer
-
-CHECKPOINT_PATH = "best_model_bukva.pth"
-ONNX_PATH = "best_model_bukva.onnx"
-
-model = SignLanguageTransformer()
-checkpoint = torch.load(CHECKPOINT_PATH, map_location="cpu", weights_only=False)
-model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
-model.eval()
-
-dummy_input = torch.randn(1, 80, 126, dtype=torch.float32)
-
-torch.onnx.export(
-    model,
-    dummy_input,
-    ONNX_PATH,
-    input_names=["landmarks"],
-    output_names=["logits"],
-    dynamic_axes={
-        "landmarks": {0: "batch_size"},
-        "logits": {0: "batch_size"},
-    },
-    opset_version=17,
-    do_constant_folding=True,
-)
-
-print(f"ONNX-модель сохранена: {ONNX_PATH}")
-```
-
-## Сборка portable Windows-версии
-
-Установите PyInstaller:
-
-```powershell
-python -m pip install pyinstaller
-```
-
-В PowerShell из корневой папки проекта:
-
-```powershell
-py -m PyInstaller --noconfirm --clean --onedir --windowed --name RSLSubtitles `
-  --add-data "LiberationSans-Regular.ttf;." `
-  --add-data "best_model_bukva.onnx;." `
-  --add-data "best_model_bukva.pth;." `
-  --collect-all mediapipe `
-  --collect-all onnxruntime `
-  --collect-all PySide6 `
-  --hidden-import onnxruntime.capi._pybind_state `
-  rsl_subtitles_desktop.py
-```
-
-Готовое приложение появится здесь:
-
-```text
-dist\RSLSubtitles\RSLSubtitles.exe
-```
-
-Перед созданием установщика всегда проверьте запуск этого `.exe` вручную.
-
-> Для `cmd.exe` замените PowerShell-символ продолжения строки `` ` `` на `^`.
-
-## Создание Windows Setup.exe
-
-1. Соберите приложение через PyInstaller.
-2. Установите Inno Setup 6.
-3. Откройте `RSLSubtitlesInstaller.iss` в Inno Setup Compiler.
-4. Проверьте, что `.iss` находится в корне проекта, а не в `dist\RSLSubtitles`.
-5. Нажмите `Build → Compile` или `F9`.
-
-Итоговый установщик будет создан в папке:
-
-```text
-installer_output\RSLSubtitlesSetup_1.0.0.exe
-```
-
-В релиз распространяется именно файл `RSLSubtitlesSetup_<VERSION>.exe`, а не содержимое `dist`.
-
-## Публикация на GitHub
-
-В репозиторий коммитятся исходники, конфигурация сборки, README и документация. В Git обычно не добавляются:
-
-```text
-.venv/
-build/
-dist/
-installer_output/
-__pycache__/
-logs/
-screenshots/
-```
-
-Готовый `RSLSubtitlesSetup_1.0.0.exe` прикрепляется в GitHub через:
-
-```text
-Repository → Releases → Draft a new release → Attach binaries → Publish release
-```
-
-Для первого стабильного релиза используйте:
-
-```text
-Git tag:       v1.0.0
-Release title: RSL Subtitles v1.0.0
-Asset:         RSLSubtitlesSetup_1.0.0.exe
-```
-
-Если ONNX или `.pth` превышают лимит обычного Git-файла, не добавляйте их в commit: размещайте их в release assets, Git LFS или в отдельном хранилище.
-
-## Тестирование перед релизом
-
-Перед публикацией выполните минимальный checklist:
-
-```text
-[ ] Запуск приложения из исходного кода в новом `.venv`
-[ ] Загрузка ONNX как приоритетной модели
-[ ] Проверка fallback на `.pth` при временном удалении ONNX
-[ ] Корректная форма model input: [1, 80, 126]
-[ ] Корректное число классов: 33
-[ ] Проверка ввода символа после удержания жеста
-[ ] Проверка повторного ввода символа после смены жеста/пропадания руки
-[ ] Проверка Space, Backspace и Clear
-[ ] Проверка нескольких камер и переключения камеры
-[ ] Проверка Debug Console и traceback
-[ ] Проверка сборки `dist\RSLSubtitles\RSLSubtitles.exe`
-[ ] Проверка `Setup.exe` на чистой Windows-машине без Python
-[ ] Проверка деинсталляции через Windows Settings
-```
 
 ## Безопасность и приватность
 
@@ -433,30 +301,6 @@ Asset:         RSLSubtitlesSetup_1.0.0.exe
 - Текущая модель распознаёт отдельные буквы, а не непрерывную полноценную речь РЖЯ.
 - Стабильность результатов зависит от соответствия preprocessing между train и inference.
 - Работа GPU через ONNX Runtime зависит от драйверов NVIDIA, CUDA и совместимости версий; CPU backend является базовым переносимым вариантом.
-
-## Roadmap
-
-- [ ] Настройки confidence threshold и времени стабильности из GUI.
-- [ ] Сохранение/экспорт текста субтитров в `.txt`.
-- [ ] История распознанных символов и событий.
-- [ ] Запись диагностических логов в пользовательскую папку.
-- [ ] Выбор ONNX-модели через GUI.
-- [ ] Проверка совместимости модели до запуска камеры.
-- [ ] Автоматические тесты preprocessing, runtime и SubtitleManager.
-- [ ] CI/CD для сборки Windows release.
-- [ ] Подпись Windows-установщика code-signing сертификатом.
-- [ ] Расширение словаря от букв к словам и динамическим жестам.
-
-## Contributing
-
-Перед изменением кода:
-
-1. Создайте отдельную ветку.
-2. Не коммитьте `.venv`, `dist`, `build` и пользовательские данные.
-3. Сохраняйте совместимость preprocessing с обученной моделью.
-4. Проверяйте приложение с ONNX и `.pth`, если оба backend поддерживаются.
-5. Добавляйте тесты для исправленных ошибок, если в проекте введён test suite.
-6. Описывайте изменения в Pull Request: что изменено, как проверено, есть ли влияние на формат модели.
 
 ## Контакты
 
